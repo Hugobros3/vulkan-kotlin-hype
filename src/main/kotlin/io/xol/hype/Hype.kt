@@ -7,17 +7,13 @@ fun main(args: Array<String>) {
 	println("hello world")
 	
 	var f = Fun("Marcel")
-	
 	println(f.intern)
 	
 	var z = Fax<Int>()
 	z.trumpet = 50
-	
 	println("${z.trumpet}")
-	
-	var wow = arrayOf(4F, 3F)
-	println(wow.length())
 
+	println(arrayOf(4F, 3F).length())
 	println(Array(0) {0F} .length())
 
 	var notZero by vetoable(5) {
