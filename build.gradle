@@ -57,6 +57,7 @@ dependencies {
 }
 
 dependencies {
+	compile group: 'org.joml', name: 'joml', version: '1.9.3'
     // This dependency is exported to consumers, that is to say found on their compile classpath.
     // api 'org.apache.commons:commons-math3:3.6.1'
 
