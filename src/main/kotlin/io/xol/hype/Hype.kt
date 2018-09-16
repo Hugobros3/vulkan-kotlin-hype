@@ -4,39 +4,43 @@ import kotlin.math.sqrt
 import kotlin.properties.Delegates.vetoable;
 
 fun main(args: Array<String>) {
-	println("hello world")
-	
-	var f = Fun("Marcel")
-	println(f.intern)
-	
-	var z = Fax<Int>()
-	z.trumpet = 50
-	println("${z.trumpet}")
+    println("hello world")
 
-	println(arrayOf(4F, 3F).length())
-	println(Array(0) {0F} .length())
+    var f = Fun("Marcel")
+    println(f.intern)
 
-	var notZero by vetoable(5) {
-		_, _, newValue -> newValue != 0
-	}
+    var z = Fax<Int>()
+    z.trumpet = 50
+    println("${z.trumpet}")
 
-	println(notZero)
-	notZero = 4
-	println(notZero)
-	notZero = 0
-	println(notZero)
+    println(arrayOf(4F, 3F).length())
+    println(Array(0) { 0F }.length())
 
-	assert(notZero != 0)
+    var notZero by vetoable(5) { _, _, newValue ->
+        newValue != 0
+    }
+
+    println(notZero)
+    notZero = 4
+    println(notZero)
+    notZero = 0
+    println(notZero)
+
+    assert(notZero != 0)
+
+    val args = arrayOf("dz", "m", "hey", "how", "is", "it", "going", "???")
+    val recreated = args.slice(2 until args.size).joinToString(separator = " ")
+    println(recreated)
 }
 
-fun Array<Float>.length() : Float {
-	return sqrt(fold(0F) {s, v -> s + v * v})
+fun Array<Float>.length(): Float {
+    return sqrt(fold(0F) { s, v -> s + v * v })
 }
 
 open class Fun(val name: String) {
-	val intern = "Bouse"
+    val intern = "Bouse"
 }
 
 class Fax<T> : Fun("Personne") {
-	var trumpet : T? = null
+    var trumpet: T? = null
 }

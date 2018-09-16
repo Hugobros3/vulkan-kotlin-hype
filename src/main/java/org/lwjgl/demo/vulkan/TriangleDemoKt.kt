@@ -11,16 +11,13 @@ import org.lwjgl.system.MemoryUtil
 import org.lwjgl.vulkan.*
 
 import java.io.IOException
-import java.nio.ByteBuffer
-import java.nio.FloatBuffer
 import java.nio.IntBuffer
-import java.nio.LongBuffer
 
 import org.lwjgl.demo.opengl.util.DemoUtils.ioResourceToByteBuffer
-import org.lwjgl.demo.vulkan.TriangleDemoKt.loadShader
 import org.lwjgl.demo.vulkan.VKUtil.translateVulkanResult
 import org.lwjgl.glfw.GLFW.*
 import org.lwjgl.glfw.GLFWVulkan.*
+import org.lwjgl.system.MemoryStack.stackPush
 import org.lwjgl.system.MemoryUtil.*
 import org.lwjgl.vulkan.EXTDebugReport.*
 import org.lwjgl.vulkan.KHRSurface.*
@@ -55,11 +52,10 @@ object TriangleDemoKt {
     private var framebuffers: LongArray? = null
     private var width: Int = 0
     private var height: Int = 0
-    private var renderCommandBuffers: Array<VkCommandBuffer?>? = null
+    private lateinit var renderCommandBuffers: Array<VkCommandBuffer?>
 
     /**
      * Create a Vulkan instance using LWJGL 3.
-     *
      * @return the VkInstance handle
      */
     private fun createInstance(requiredExtensions: PointerBuffer): VkInstance {
@@ -68,11 +64,15 @@ object TriangleDemoKt {
                 .pApplicationName(memUTF8("GLFW Vulkan Demo"))
                 .pEngineName(memUTF8(""))
                 .apiVersion(VK_MAKE_VERSION(1, 0, 2))
+
+        // Takes the required extensions by glfw and add to them the extension for debug reporting
         val ppEnabledExtensionNames = memAllocPointer(requiredExtensions.remaining() + 1)
         ppEnabledExtensionNames.put(requiredExtensions)
         val VK_EXT_DEBUG_REPORT_EXTENSION = memUTF8(VK_EXT_DEBUG_REPORT_EXTENSION_NAME)
         ppEnabledExtensionNames.put(VK_EXT_DEBUG_REPORT_EXTENSION)
         ppEnabledExtensionNames.flip()
+
+        // If validation is enabled, add the layers asked for
         val ppEnabledLayerNames = memAllocPointer(layers.size)
         var i = 0
         while (validation && i < layers.size) {
@@ -80,6 +80,8 @@ object TriangleDemoKt {
             i++
         }
         ppEnabledLayerNames.flip()
+
+        //Create the Vulkan instance itself
         val pCreateInfo = VkInstanceCreateInfo.calloc()
                 .sType(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
                 .pNext(NULL)
@@ -93,6 +95,8 @@ object TriangleDemoKt {
         if (err != VK_SUCCESS) {
             throw AssertionError("Failed to create VkInstance: " + translateVulkanResult(err))
         }
+
+        //Wraps that instance handle into an object
         val ret = VkInstance(instance, pCreateInfo)
         pCreateInfo.free()
         memFree(ppEnabledLayerNames)
@@ -104,6 +108,7 @@ object TriangleDemoKt {
         return ret
     }
 
+    /** Creates a callback object that'll call the callback method when an event matching the flags occurs on the instance */
     private fun setupDebugging(instance: VkInstance, flags: Int, callback: VkDebugReportCallbackEXT): Long {
         val dbgCreateInfo = VkDebugReportCallbackCreateInfoEXT.calloc()
                 .sType(VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT)
@@ -123,22 +128,37 @@ object TriangleDemoKt {
     }
 
     private fun getFirstPhysicalDevice(instance: VkInstance): VkPhysicalDevice {
-        val pPhysicalDeviceCount = memAllocInt(1)
-        var err = vkEnumeratePhysicalDevices(instance, pPhysicalDeviceCount, null)
-        if (err != VK_SUCCESS) {
-            throw AssertionError("Failed to get number of physical devices: " + translateVulkanResult(err))
+        stackPush().use {
+            // First gets the count of physical devices ...
+            val pPhysicalDeviceCount = it.mallocInt(1)
+            var err = vkEnumeratePhysicalDevices(instance, pPhysicalDeviceCount, null)
+            if (err != VK_SUCCESS) {
+                throw AssertionError("Failed to get number of physical devices: " + translateVulkanResult(err))
+            }
+
+            // Then make a suitably sized array and grab'em
+            val pPhysicalDevices = it.mallocPointer(pPhysicalDeviceCount.get(0))
+            err = vkEnumeratePhysicalDevices(instance, pPhysicalDeviceCount, pPhysicalDevices)
+            if (err != VK_SUCCESS) {
+                throw AssertionError("Failed to get physical devices: " + translateVulkanResult(err))
+            }
+
+            //We are only interested in the first device
+            val physicalDeviceHandle = pPhysicalDevices.get(0)
+
+            val physicalDevice = VkPhysicalDevice(physicalDeviceHandle, instance)
+
+            val pProperties = VkPhysicalDeviceProperties.callocStack(it)
+            vkGetPhysicalDeviceProperties(physicalDevice, pProperties)
+
+            println(pProperties.deviceNameString())
+            println(pProperties.deviceType())
+
+            return physicalDevice
         }
-        val pPhysicalDevices = memAllocPointer(pPhysicalDeviceCount.get(0))
-        err = vkEnumeratePhysicalDevices(instance, pPhysicalDeviceCount, pPhysicalDevices)
-        val physicalDevice = pPhysicalDevices.get(0)
-        memFree(pPhysicalDeviceCount)
-        memFree(pPhysicalDevices)
-        if (err != VK_SUCCESS) {
-            throw AssertionError("Failed to get physical devices: " + translateVulkanResult(err))
-        }
-        return VkPhysicalDevice(physicalDevice, instance)
     }
 
+    /** Wrapper for a VK device and it's properties */
     private class DeviceAndGraphicsQueueFamily {
         internal var device: VkDevice? = null
         internal var queueFamilyIndex: Int = 0
@@ -146,68 +166,83 @@ object TriangleDemoKt {
     }
 
     private fun createDeviceAndGetGraphicsQueueFamily(physicalDevice: VkPhysicalDevice): DeviceAndGraphicsQueueFamily {
-        val pQueueFamilyPropertyCount = memAllocInt(1)
-        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, null)
-        val queueCount = pQueueFamilyPropertyCount.get(0)
-        val queueProps = VkQueueFamilyProperties.calloc(queueCount)
-        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, queueProps)
-        memFree(pQueueFamilyPropertyCount)
-        var graphicsQueueFamilyIndex: Int
-        graphicsQueueFamilyIndex = 0
-        while (graphicsQueueFamilyIndex < queueCount) {
-            if (queueProps.get(graphicsQueueFamilyIndex).queueFlags() and VK_QUEUE_GRAPHICS_BIT != 0)
-                break
-            graphicsQueueFamilyIndex++
+        stackPush().use {
+            //Ask for the number of queues families available (we get the size of the structure containing their properties, so that size == count )
+            val pQueueFamilyPropertyCount = it.mallocInt(1)
+            vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, null)
+            val queueCount = pQueueFamilyPropertyCount.get(0)
+
+            // Get the properties for those queue families
+            val queueFamilyProps = VkQueueFamilyProperties.callocStack(queueCount, it)
+            vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, queueFamilyProps)
+            //memFree(pQueueFamilyPropertyCount)
+
+            // Iterate on the queue families to find the one that has what we need
+            var graphicsQueueFamilyIndex = 0
+            while (graphicsQueueFamilyIndex < queueCount) {
+                if (queueFamilyProps.get(graphicsQueueFamilyIndex).queueFlags() and VK_QUEUE_GRAPHICS_BIT != 0)
+                    break
+                graphicsQueueFamilyIndex++
+            }
+            //queueFamilyProps.free()
+
+            // Fill in the queue creation form
+            val pQueuePriorities = it.mallocFloat(1).put(0.0f)
+            pQueuePriorities.flip()
+            val queueCreateInfo = VkDeviceQueueCreateInfo.callocStack(1, it)
+                    .sType(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
+                    .queueFamilyIndex(graphicsQueueFamilyIndex)
+                    .pQueuePriorities(pQueuePriorities)
+
+            // Fill in the required extensions form (we only want swapchain)
+            val extensions = it.mallocPointer(1)
+            val VK_KHR_SWAPCHAIN_EXTENSION = memUTF8(VK_KHR_SWAPCHAIN_EXTENSION_NAME)
+            extensions.put(VK_KHR_SWAPCHAIN_EXTENSION)
+            extensions.flip()
+
+            // Same as in instance creation we require layers if validation is on
+            val ppEnabledLayerNames = it.mallocPointer(layers.size)
+            var i = 0
+            while (validation && i < layers.size) {
+                ppEnabledLayerNames.put(layers[i])
+                i++
+            }
+            ppEnabledLayerNames.flip() // this has readable size = zero if validation is off
+
+            // Device creation form
+            val deviceCreateInfo = VkDeviceCreateInfo.callocStack()
+                    .sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
+                    .pNext(NULL)
+                    .pQueueCreateInfos(queueCreateInfo)
+                    .ppEnabledExtensionNames(extensions)
+                    .ppEnabledLayerNames(ppEnabledLayerNames)
+
+            // Create the logical device with all this
+            val pDevice = it.mallocPointer(1)
+            val err = vkCreateDevice(physicalDevice, deviceCreateInfo, null, pDevice)
+            val device = pDevice.get(0)
+            //memFree(pDevice)
+            if (err != VK_SUCCESS) {
+                throw AssertionError("Failed to create device: " + translateVulkanResult(err))
+            }
+
+            // Query the memory properties of the physical device
+            val memoryProperties = VkPhysicalDeviceMemoryProperties.callocStack()
+            vkGetPhysicalDeviceMemoryProperties(physicalDevice, memoryProperties)
+
+            // Create the wrapper object for all that
+            val ret = DeviceAndGraphicsQueueFamily()
+            ret.device = VkDevice(device, physicalDevice, deviceCreateInfo)
+            ret.queueFamilyIndex = graphicsQueueFamilyIndex
+            ret.memoryProperties = memoryProperties
+
+            /*deviceCreateInfo.free()
+            memFree(ppEnabledLayerNames)
+            memFree(VK_KHR_SWAPCHAIN_EXTENSION)
+            memFree(extensions)
+            memFree(pQueuePriorities)*/
+            return ret
         }
-        queueProps.free()
-        val pQueuePriorities = memAllocFloat(1).put(0.0f)
-        pQueuePriorities.flip()
-        val queueCreateInfo = VkDeviceQueueCreateInfo.calloc(1)
-                .sType(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
-                .queueFamilyIndex(graphicsQueueFamilyIndex)
-                .pQueuePriorities(pQueuePriorities)
-
-        val extensions = memAllocPointer(1)
-        val VK_KHR_SWAPCHAIN_EXTENSION = memUTF8(VK_KHR_SWAPCHAIN_EXTENSION_NAME)
-        extensions.put(VK_KHR_SWAPCHAIN_EXTENSION)
-        extensions.flip()
-        val ppEnabledLayerNames = memAllocPointer(layers.size)
-        var i = 0
-        while (validation && i < layers.size) {
-            ppEnabledLayerNames.put(layers[i])
-            i++
-        }
-        ppEnabledLayerNames.flip()
-
-        val deviceCreateInfo = VkDeviceCreateInfo.calloc()
-                .sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
-                .pNext(NULL)
-                .pQueueCreateInfos(queueCreateInfo)
-                .ppEnabledExtensionNames(extensions)
-                .ppEnabledLayerNames(ppEnabledLayerNames)
-
-        val pDevice = memAllocPointer(1)
-        val err = vkCreateDevice(physicalDevice, deviceCreateInfo, null, pDevice)
-        val device = pDevice.get(0)
-        memFree(pDevice)
-        if (err != VK_SUCCESS) {
-            throw AssertionError("Failed to create device: " + translateVulkanResult(err))
-        }
-
-        val memoryProperties = VkPhysicalDeviceMemoryProperties.calloc()
-        vkGetPhysicalDeviceMemoryProperties(physicalDevice, memoryProperties)
-
-        val ret = DeviceAndGraphicsQueueFamily()
-        ret.device = VkDevice(device, physicalDevice, deviceCreateInfo)
-        ret.queueFamilyIndex = graphicsQueueFamilyIndex
-        ret.memoryProperties = memoryProperties
-
-        deviceCreateInfo.free()
-        memFree(ppEnabledLayerNames)
-        memFree(VK_KHR_SWAPCHAIN_EXTENSION)
-        memFree(extensions)
-        memFree(pQueuePriorities)
-        return ret
     }
 
     private class ColorFormatAndSpace {
@@ -219,6 +254,7 @@ object TriangleDemoKt {
         val pQueueFamilyPropertyCount = memAllocInt(1)
         vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, null)
         val queueCount = pQueueFamilyPropertyCount.get(0)
+
         val queueProps = VkQueueFamilyProperties.calloc(queueCount)
         vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, queueProps)
         memFree(pQueueFamilyPropertyCount)
@@ -342,6 +378,7 @@ object TriangleDemoKt {
         return VkCommandBuffer(commandBuffer, device)
     }
 
+    /** Records an image barrier in the supplied command buffer */
     private fun imageBarrier(cmdbuffer: VkCommandBuffer, image: Long, aspectMask: Int, oldImageLayout: Int, srcAccess: Int, newImageLayout: Int, dstAccess: Int) {
         // Create an image barrier object
         val imageMemoryBarrier = VkImageMemoryBarrier.calloc(1)
@@ -371,12 +408,14 @@ object TriangleDemoKt {
         imageMemoryBarrier.free()
     }
 
+    /** Wrapper over the current swapchain arrangement */
     private class Swapchain {
         internal var swapchainHandle: Long = 0
         internal var images: LongArray? = null
         internal var imageViews: LongArray? = null
     }
 
+    /** Creates the swap chain & records barriers waiting on those new swapchain images */
     private fun createSwapChain(device: VkDevice?, physicalDevice: VkPhysicalDevice, surface: Long, oldSwapChain: Long, commandBuffer: VkCommandBuffer, newWidth: Int,
                                 newHeight: Int, colorFormat: Int, colorSpace: Int): Swapchain {
         var err: Int
@@ -455,9 +494,12 @@ object TriangleDemoKt {
                 .oldSwapchain(oldSwapChain)
                 .clipped(true)
                 .compositeAlpha(VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
+
         swapchainCI.imageExtent()
                 .width(width)
                 .height(height)
+
+        // Actually create the thing
         val pSwapChain = memAllocLong(1)
         err = vkCreateSwapchainKHR(device!!, swapchainCI, null, pSwapChain)
         swapchainCI.free()
@@ -473,54 +515,59 @@ object TriangleDemoKt {
             vkDestroySwapchainKHR(device, oldSwapChain, null)
         }
 
+        // Grab the images from the swapchain
         val pImageCount = memAllocInt(1)
         err = vkGetSwapchainImagesKHR(device, swapChain, pImageCount, null)
         val imageCount = pImageCount.get(0)
         if (err != VK_SUCCESS) {
             throw AssertionError("Failed to get number of swapchain images: " + translateVulkanResult(err))
         }
-
         val pSwapchainImages = memAllocLong(imageCount)
         err = vkGetSwapchainImagesKHR(device, swapChain, pImageCount, pSwapchainImages)
         if (err != VK_SUCCESS) {
             throw AssertionError("Failed to get swapchain images: " + translateVulkanResult(err))
         }
         memFree(pImageCount)
-
         val images = LongArray(imageCount)
-        val imageViews = LongArray(imageCount)
-        val pBufferView = memAllocLong(1)
-        val colorAttachmentView = VkImageViewCreateInfo.calloc()
+
+        // The common ImageView parameters (shared accross all swapchain images)
+        val imagerViewCreationInfo = VkImageViewCreateInfo.calloc()
                 .sType(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
                 .pNext(NULL)
                 .format(colorFormat)
                 .viewType(VK_IMAGE_VIEW_TYPE_2D)
                 .flags(VK_FLAGS_NONE)
-        colorAttachmentView.components()
-                .r(VK_COMPONENT_SWIZZLE_R)
-                .g(VK_COMPONENT_SWIZZLE_G)
-                .b(VK_COMPONENT_SWIZZLE_B)
-                .a(VK_COMPONENT_SWIZZLE_A)
-        colorAttachmentView.subresourceRange()
+        imagerViewCreationInfo.components()
+                .r(VK_COMPONENT_SWIZZLE_R) // or VK_COMPONENT_SWIZZLE_IDENTITY
+                .g(VK_COMPONENT_SWIZZLE_G) // or VK_COMPONENT_SWIZZLE_IDENTITY
+                .b(VK_COMPONENT_SWIZZLE_B) // or VK_COMPONENT_SWIZZLE_IDENTITY
+                .a(VK_COMPONENT_SWIZZLE_A) // or VK_COMPONENT_SWIZZLE_IDENTITY
+        imagerViewCreationInfo.subresourceRange()
                 .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
                 .baseMipLevel(0)
                 .levelCount(1)
                 .baseArrayLayer(0)
                 .layerCount(1)
+
+        // Creates the image views for those swapchain images
+        val imageViews = LongArray(imageCount)
+        val pBufferView = memAllocLong(1)
         for (i in 0 until imageCount) {
             images[i] = pSwapchainImages.get(i)
-            // Bring the image from an UNDEFINED state to the VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT state
-            imageBarrier(commandBuffer, images[i], VK_IMAGE_ASPECT_COLOR_BIT,
-                    VK_IMAGE_LAYOUT_UNDEFINED, 0,
-                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
-            colorAttachmentView.image(images[i])
-            err = vkCreateImageView(device, colorAttachmentView, null, pBufferView)
+
+            imagerViewCreationInfo.image(images[i])
+            err = vkCreateImageView(device, imagerViewCreationInfo, null, pBufferView)
             imageViews[i] = pBufferView.get(0)
             if (err != VK_SUCCESS) {
                 throw AssertionError("Failed to create image view: " + translateVulkanResult(err))
             }
+
+            // Bring the image from an UNDEFINED state to the VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT state
+            imageBarrier(commandBuffer, images[i], VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_LAYOUT_UNDEFINED, 0,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
         }
-        colorAttachmentView.free()
+        imagerViewCreationInfo.free()
         memFree(pBufferView)
         memFree(pSwapchainImages)
 
@@ -667,7 +714,7 @@ object TriangleDemoKt {
 
     private class Vertices {
         internal var verticesBuf: Long = 0
-        internal var createInfo: VkPipelineVertexInputStateCreateInfo? = null
+        internal lateinit var createInfo: VkPipelineVertexInputStateCreateInfo
     }
 
     private fun createVertices(deviceMemoryProperties: VkPhysicalDeviceMemoryProperties?, device: VkDevice?): Vertices {
@@ -768,7 +815,7 @@ object TriangleDemoKt {
     }
 
     @Throws(IOException::class)
-    private fun createPipeline(device: VkDevice?, renderPass: Long, vi: VkPipelineVertexInputStateCreateInfo?): Long {
+    private fun createPipeline(device: VkDevice?, renderPass: Long, vertexInput: VkPipelineVertexInputStateCreateInfo): Long {
         var err: Int
         // Vertex input state
         // Describes the topoloy used with this pipeline
@@ -780,8 +827,8 @@ object TriangleDemoKt {
         val rasterizationState = VkPipelineRasterizationStateCreateInfo.calloc()
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO)
                 .polygonMode(VK_POLYGON_MODE_FILL)
-                .cullMode(VK_CULL_MODE_NONE)
-                .frontFace(VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                .cullMode(VK_CULL_MODE_BACK_BIT)
+                .frontFace(VK_FRONT_FACE_CLOCKWISE)
                 .depthClampEnable(false)
                 .rasterizerDiscardEnable(false)
                 .depthBiasEnable(false)
@@ -862,7 +909,7 @@ object TriangleDemoKt {
                 .sType(VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO)
                 .layout(layout) // <- the layout used for this pipeline (NEEDS TO BE SET! even though it is basically empty)
                 .renderPass(renderPass) // <- renderpass this pipeline is attached to
-                .pVertexInputState(vi!!)
+                .pVertexInputState(vertexInput)
                 .pInputAssemblyState(inputAssemblyState)
                 .pRasterizationState(rasterizationState)
                 .pColorBlendState(colorBlendState)
@@ -876,6 +923,8 @@ object TriangleDemoKt {
         val pPipelines = memAllocLong(1)
         err = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, pipelineCreateInfo, null, pPipelines)
         val pipeline = pPipelines.get(0)
+
+        //TODO stack-based alloc
         shaderStages.free()
         multisampleState.free()
         depthStencilState.free()
@@ -1081,12 +1130,13 @@ object TriangleDemoKt {
             throw AssertionError("GLFW failed to find the Vulkan loader")
         }
 
-        /* Look for instance extensions */
+        // Look for instance extensions
         val requiredExtensions = glfwGetRequiredInstanceExtensions()
                 ?: throw AssertionError("Failed to find list of required Vulkan extensions")
 
-        // Create the Vulkan instance
         val instance = createInstance(requiredExtensions)
+
+        /** setup debug */
         val debugCallback = object : VkDebugReportCallbackEXT() {
             override fun invoke(flags: Int, objectType: Int, `object`: Long, location: Long, messageCode: Int, pLayerPrefix: Long, pMessage: Long, pUserData: Long): Int {
                 System.err.println("ERROR OCCURED: " + VkDebugReportCallbackEXT.getString(pMessage))
@@ -1094,8 +1144,10 @@ object TriangleDemoKt {
             }
         }
         val debugCallbackHandle = setupDebugging(instance, VK_DEBUG_REPORT_ERROR_BIT_EXT or VK_DEBUG_REPORT_WARNING_BIT_EXT, debugCallback)
+
         val physicalDevice = getFirstPhysicalDevice(instance)
         val deviceAndGraphicsQueueFamily = createDeviceAndGetGraphicsQueueFamily(physicalDevice)
+
         val device = deviceAndGraphicsQueueFamily.device
         val queueFamilyIndex = deviceAndGraphicsQueueFamily.queueFamilyIndex
         val memoryProperties = deviceAndGraphicsQueueFamily.memoryProperties
@@ -1113,8 +1165,9 @@ object TriangleDemoKt {
                     glfwSetWindowShouldClose(window, true)
             }
         }
-
         glfwSetKeyCallback(window, keyCallback)
+
+        // Create Vulkan surface using GLFW
         val pSurface = memAllocLong(1)
         var err = glfwCreateWindowSurface(instance, window, null, pSurface)
         val surface = pSurface.get(0)
@@ -1122,12 +1175,14 @@ object TriangleDemoKt {
             throw AssertionError("Failed to create surface: " + translateVulkanResult(err))
         }
 
-        // Create static Vulkan resources
+        //Obtain the color format & space for the providen surface
         val colorFormatAndSpace = getColorFormatAndSpace(physicalDevice, surface)
+
         val commandPool = createCommandPool(device, queueFamilyIndex)
         val setupCommandBuffer = createCommandBuffer(device, commandPool)
         val postPresentCommandBuffer = createCommandBuffer(device, commandPool)
         val queue = createDeviceQueue(device, queueFamilyIndex)
+
         val renderPass = createRenderPass(device, colorFormatAndSpace.colorFormat)
         val renderCommandPool = createCommandPool(device, queueFamilyIndex)
         val vertices = createVertices(memoryProperties, device)
@@ -1162,7 +1217,7 @@ object TriangleDemoKt {
                 }
                 framebuffers = createFramebuffers(device, swapchain!!, renderPass, width, height)
                 // Create render command buffers
-                if (renderCommandBuffers != null) {
+                if (::renderCommandBuffers.isInitialized) {
                     vkResetCommandPool(device!!, renderCommandPool, VK_FLAGS_NONE)
                 }
                 renderCommandBuffers = createRenderCommandBuffers(device, renderCommandPool, framebuffers!!, renderPass, width, height, pipeline,
@@ -1190,7 +1245,7 @@ object TriangleDemoKt {
         // Pre-allocate everything needed in the render loop
 
         val pImageIndex = memAllocInt(1)
-        var currentBuffer = 0
+        var currentBuffer: Int
         val pCommandBuffers = memAllocPointer(1)
         val pSwapchains = memAllocLong(1)
         val pImageAcquiredSemaphore = memAllocLong(1)
@@ -1253,7 +1308,7 @@ object TriangleDemoKt {
             }
 
             // Select the command buffer for the current framebuffer image/attachment
-            pCommandBuffers.put(0, renderCommandBuffers!![currentBuffer])
+            pCommandBuffers.put(0, renderCommandBuffers!![currentBuffer]!!)
 
             // Submit to the graphics queue
             err = vkQueueSubmit(queue, submitInfo, VK_NULL_HANDLE)
